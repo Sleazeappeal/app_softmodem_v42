@@ -1,5 +1,28 @@
 # V.42 / V.42bis for Asterisk app_softmodem
 
+## Credits
+
+This project builds on the work of others:
+
+- **app_softmodem** was written by **Christian Groeger** (2010), based on
+  Asterisk's `app_fax.c` by **Dmitry Andrianov** and **Steve Underwood**.
+  Original repository: [proquar/asterisk-Softmodem](https://github.com/proquar/asterisk-Softmodem).
+- Parity options by **Rob O'Donnell** (2018).
+- Asterisk 18+ compatibility, TDD (Baudot), Bell 202, originate mode, TLS and
+  many fixes by **Naveen Albert** (2021, 2023), maintained in
+  [InterLinked1/phreakscript](https://github.com/InterLinked1/phreakscript)
+  ([`apps/app_softmodem.c`](https://github.com/InterLinked1/phreakscript/blob/master/apps/app_softmodem.c)).
+  **This project starts from that version.**
+- **spandsp** by **Steve Underwood**, which provides the modems, V.42 and
+  V.42bis ([freeswitch/spandsp](https://github.com/freeswitch/spandsp); here
+  the Debian package 0.0.6+dfsg-2.2).
+- The V.42bis negotiation follows **slmodem** by Smart Link Ltd. as a
+  reference.
+
+Thank you to all of them.
+
+## What this adds
+
 `app_softmodem` lets Asterisk answer analogue modem calls and connect the
 caller to a TCP service, for example a BBS. This project adds what a real
 1990s modem expects on a V.22bis (2400 bit/s) or V.22 (1200 bit/s) call:
@@ -44,9 +67,7 @@ been tested.
 | `tools/` | test server, modem-side test client, offline decoder, sanitizer tests |
 | `CHANGES.md` | what was changed and why |
 
-The module is based on `app_softmodem.c` from
-[PhreakScript](https://github.com/InterLinked1/phreakscript/blob/master/apps/app_softmodem.c)
-(Christian Groeger, Rob O'Donnell, Naveen Albert).
+The module is based on PhreakScript's `app_softmodem.c` (see Credits).
 
 ## Building
 
