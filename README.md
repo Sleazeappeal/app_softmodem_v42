@@ -166,8 +166,12 @@ somewhere (`logger.conf`).
 
 - Not implemented: V.44, MNP, SREJ, V.8. Modems that offer them fall back
   to V.42bis, V.42 and the V.22bis handshake by themselves.
-- The calling side (`f` option) with V.42 has not been tested.
-- TLS (`x`) has not been tested together with V.42.
+- The calling side (`f` option) with V.42 has not been tested. It would
+  matter if the softmodem dialled out to a modem, for example for
+  BBS-to-BBS mail exchange; a BBS that only answers calls does not use it.
+- TLS (`x`) has not been tested together with V.42. It would matter if the
+  TCP service ran on another host; with the service on the same machine
+  (`127.0.0.1`) there is nothing to encrypt.
 - Without error correction, some softmodems (the HaM above) do not notice
   that the carrier is gone and keep printing line noise after the call ends.
   An ATA that cuts the loop current on hang-up ("current disconnect") fixes
@@ -177,6 +181,28 @@ somewhere (`logger.conf`).
   2400 bit/s; not reproduced.
 - spandsp 0.0.6 only. Newer spandsp versions have a different V.42 code base
   and the patch does not apply.
+
+### Not fixed in the original module
+
+A code review found these in parts of `app_softmodem.c` this project did not
+change, on paths it does not use. They are listed so that anyone using those
+parts knows about them:
+
+- **TLS (`x`):** the read paths decide whether to retry from `errno` instead
+  of `SSL_get_error()`, so a temporary TLS condition can end the session and
+  a real error can be retried; the handshake loop spins on `WANT_READ` and
+  does not handle `WANT_WRITE`; the server certificate is not verified (the
+  code says so itself).
+- **TDD (Baudot, `v(baudot45)` / `v(baudot50)`):** data read from the socket
+  is stored at `buf + 2` but terminated at `buf[pres]`, so the last two bytes
+  of each read are cut off and a stale byte can remain.
+- **Async framing:** the receiver always consumes 10 bits per character,
+  which is only right for 10-bit frames such as 8N1 or 7E1; 8N2 or 7N1
+  framing is decoded wrong. With V.42 (or its 8N1 fallback) this does not
+  apply.
+- **FSK modes (V.21, V.23, Bell 103, Bell 202):** the FSK modem objects are
+  never freed (a small leak per call), and some early error returns skip
+  restoring the channel's audio formats.
 
 ## Tools
 
