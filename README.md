@@ -25,7 +25,7 @@ The changes in this project (the V.42/V.42bis integration, the spandsp
 fixes, the test tools and this documentation) were developed with
 **Claude Opus 5.5** (Anthropic), working in Claude Code, together with the
 repository owner, who did all the testing with the real modems and made the
-design decisions. The code was also reviewed with **OpenAI Codex**.
+design decisions. The code was also reviewed with **GPT-6.1 SOL** (OpenAI Codex).
 
 ## What this adds
 
