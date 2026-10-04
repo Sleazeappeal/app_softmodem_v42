@@ -1,0 +1,682 @@
+--- a/apps/app_softmodem.c
++++ b/apps/app_softmodem.c
+@@ -14,6 +14,18 @@
+  * by Naveen Albert <asterisk@phreaknet.org>, 2021, 2023.
+  * Note that default behavior has been changed from MSB to LSB.
+  *
++ * V.42 error correction and V.42bis compression for V.22/V.22bis added 2026
++ * for PiranjaBBS, tested against Rockwell, USRobotics, Smart Link (HaM) and
++ * Conexant (SoftK56) modems:
++ * - option 'c': V.42 (LAP-M) using spandsp's v42.c, with fallback to plain
++ *   async framing when the caller does not answer V.42 detection;
++ * - option 'b': V.42bis on top of V.42;
++ * - a clean call end when the TCP side closes (flush, V.42 DISC, idle
++ *   carrier, silence).
++ * Needs a patched spandsp 0.0.6 (v42.c, v42bis.c, v22bis_rx.c): stock
++ * spandsp discards the negotiated V.42bis parameters and has several LAP-M
++ * and XID bugs that real modems do not tolerate.
++ *
+  * This program is free software, distributed under the terms of
+  * the GNU General Public License
+  *
+@@ -52,6 +64,8 @@
+ #endif
+ #include <spandsp/v22bis.h>
+ #include <spandsp/v18.h>
++#include <spandsp/v42.h>
++#include <spandsp/v42bis.h>
+ 
+ /* For TDD stuff */
+ #define SPANDSP_EXPOSE_INTERNAL_STRUCTURES
+@@ -154,6 +168,16 @@
+ 					<option name="x">
+ 						<para>Use TLS encryption for the data connection.</para>
+ 					</option>
++					<option name="c">
++						<para>Enable V.42 (LAP-M) error correction. Only applies to V22/V22bis.
++						Falls back to raw (uncorrected) mode automatically if the far end does not
++						support V.42.</para>
++					</option>
++					<option name="b">
++						<para>Enable V.42bis data compression on top of V.42 (requires option 'c').
++						Only takes effect if the far end offers V.42bis; otherwise V.42 runs
++						uncompressed, as with 'c' alone. Requires a patched spandsp.</para>
++					</option>
+ 				</optionlist>
+ 			</parameter>
+ 		</syntax>
+@@ -203,6 +227,8 @@
+ 	OPT_ODD_PARITY = 	 (1 << 10),
+ 	OPT_TLS =            (1 << 11),
+ 	OPT_FLIP_MODE =      (1 << 12),
++	OPT_V42 =            (1 << 13),
++	OPT_V42BIS =         (1 << 14),
+ };
+ 
+ enum {
+@@ -229,9 +255,13 @@
+ 	AST_APP_OPTION('n', OPT_NULL),
+ 	AST_APP_OPTION('x', OPT_TLS),
+ 	AST_APP_OPTION('f', OPT_FLIP_MODE),
++	AST_APP_OPTION('c', OPT_V42),
++	AST_APP_OPTION('b', OPT_V42BIS),
+ END_OPTIONS );
+ 
+ #define MAX_SAMPLES 240
++/* Compressed TX data waiting for LAP-M, which takes N401 (128) bytes at a time */
++#define V42BIS_TXQUEUE_SIZE (V42BIS_MAX_OUTPUT_LENGTH * 8)
+ 
+ enum {
+ 	VERSION_V21,
+@@ -244,6 +274,21 @@
+ 	VERSION_V18_50, /* V18_MODE_5BIT_50 */
+ };
+ 
++/*! \brief V.42 state of a session with option 'c'.
++ * OFF: waiting for carrier; async framing owns the bit stream.
++ * NEGOTIATING, ACTIVE, RELEASED (link disconnected after ACTIVE): V.42 owns it.
++ * FALLBACK: the caller does not do V.42; async framing owns it. */
++enum {
++	V42_MODE_OFF = 0,
++	V42_MODE_NEGOTIATING,
++	V42_MODE_ACTIVE,
++	V42_MODE_FALLBACK,
++	V42_MODE_RELEASED,
++};
++
++/* Idle marks before the first character after falling back to async mode */
++#define RAW_IDLE_MS		500
++
+ typedef struct {
+ 	struct ast_channel *chan;
+ 	const char *host;	//telnetd host+port
+@@ -260,6 +305,20 @@
+ 	int	paritytype;
+ 	unsigned int flipmode:1;
+ 	unsigned int track_session:1;
++	unsigned int use_v42:1;
++	int v42mode;
++	/* Mark bits still to send before the first async data in FALLBACK mode */
++	int raw_idle_bits;
++	v42_state_t v42;
++	unsigned int use_v42bis:1;
++	/* Set once V.42bis is known not to run, so it is not checked again */
++	unsigned int v42bis_decided:1;
++	/* Allocated by spandsp (v42bis_init(NULL, ...)), unlike v42 above */
++	v42bis_state_t *v42bis;
++	uint8_t v42bis_txqueue[V42BIS_TXQUEUE_SIZE];
++	int v42bis_txqueue_len;
++	/* For the trained bit rate */
++	v22bis_state_t *v22_modem;
+ } modem_session;
+ 
+ #define MODEM_BITBUFFER_SIZE 16
+@@ -281,6 +340,51 @@
+ 	modem_session *session;
+ } modem_data;
+ 
++/* How long a write to the server may wait for room in the socket buffer */
++#define SOCKET_WRITE_MS		2000
++
++/*! \brief Writes all of buf to the server. The socket is non-blocking, so a
++ * full send buffer is waited out for up to SOCKET_WRITE_MS. Data from the
++ * modem must not be dropped (with V.42 it is already acknowledged), so if it
++ * cannot be written the session ends. */
++static void socket_write_all(modem_data *d, const void *buf, int len)
++{
++	const char *p = buf;
++	int rc;
++
++	while (len > 0) {
++#ifdef HAVE_OPENSSL
++		if (d->ssl) {
++			rc = SSL_write(d->ssl, p, len);
++			if (rc <= 0) {
++				break;
++			}
++		} else
++#endif
++		{
++			rc = send(d->sock, p, len, MSG_NOSIGNAL);
++			if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
++				struct pollfd pfd = { .fd = d->sock, .events = POLLOUT };
++
++				if (poll(&pfd, 1, SOCKET_WRITE_MS) > 0) {
++					continue;
++				}
++				break;
++			}
++			if (rc <= 0) {
++				break;
++			}
++		}
++		p += rc;
++		len -= rc;
++	}
++	if (len > 0) {
++		ast_log(LOG_WARNING, "Could not write %d bytes to the server on %s, ending session\n",
++			len, ast_channel_name(d->session->chan));
++		d->session->finished = 1;
++	}
++}
++
+ /*! \brief This is called by spandsp whenever it filters a new bit from the line */
+ static void modem_put_bit(void *user_data, int bit)
+ {
+@@ -344,14 +448,7 @@
+ 
+ 					if (!paritybits || (paritybits && (rx->bitbuffer[(rx->readpos + databits + 1) % MODEM_BITBUFFER_SIZE] == ((rx->session->paritytype == 2) ^ __builtin_parity(byte))))) {
+ 						ast_debug(7, "send(%d), [%d] %c\n", rx->sock, byte, isprint(byte) ? byte : ' ');
+-#ifdef HAVE_OPENSSL
+-						if (rx->ssl) {
+-							SSL_write(rx->ssl, &byte, 1);
+-						} else
+-#endif
+-						{
+-							send(rx->sock, &byte, 1, 0);
+-						}
++						socket_write_all(rx, &byte, 1);
+ 					} /* else invalid parity, ignore byte */
+ 					rx->readpos= (rx->readpos + 10) % MODEM_BITBUFFER_SIZE; /* XXX Why does this increment by 10? */
+ 					rx->fill -= 10;
+@@ -369,6 +466,264 @@
+ 	}
+ }
+ 
++/*! \brief V.42bis encode handler: queues compressed output until
++ * v42_iframe_get() hands it to LAP-M. user_data is the modem_session. */
++static void v42bis_encode_put(void *user_data, const uint8_t *buf, int len)
++{
++	modem_session *s = (modem_session*) user_data;
++
++	if (s->v42bis_txqueue_len + len > (int) sizeof(s->v42bis_txqueue)) {
++		/* v42_iframe_get() bounds its reads so this cannot happen. Dropping
++		 * data would corrupt the compressed stream: end the session. */
++		ast_log(LOG_WARNING, "V.42bis TX queue overflow on %s, ending session\n",
++			ast_channel_name(s->chan));
++		s->finished = 1;
++		return;
++	}
++	memcpy(s->v42bis_txqueue + s->v42bis_txqueue_len, buf, len);
++	s->v42bis_txqueue_len += len;
++}
++
++/*! \brief V.42bis decode handler: writes decompressed data to the socket.
++ * user_data is a modem_data (rx and tx share the socket). */
++static void v42bis_decode_put(void *user_data, const uint8_t *buf, int len)
++{
++	socket_write_all((modem_data*) user_data, buf, len);
++}
++
++/*! \brief Starts V.42bis once V.42 is ACTIVE, if the XID exchange agreed on
++ * it. Called from both I-frame callbacks; a no-op once decided. Compression
++ * must cover every byte from the first I-frame on: the peer's decoder is
++ * live from link setup, so any delay desynchronises the dictionaries. */
++static void v42bis_maybe_start(modem_session *s, void *v42bis_user_data)
++{
++	int comp, dict_size, max_string;
++
++	if (!s->use_v42bis || s->v42bis || s->v42bis_decided || s->v42mode != V42_MODE_ACTIVE) {
++		return;
++	}
++	if (!v42_get_negotiated_v42bis(&s->v42, &comp, &dict_size, &max_string)) {
++		return;
++	}
++	if (comp == V42BIS_P0_NEITHER_DIRECTION) {
++		ast_verb(2, "V.42bis not offered by peer on %s, running V.42 without compression\n",
++			ast_channel_name(s->chan));
++		s->v42bis_decided = 1;
++		return;
++	}
++	/* P0 bit 1 is the XID initiator -> responder direction, bit 2 the other
++	 * one; v42bis_init() reads bit 1 as "decompress", bit 2 as "compress",
++	 * which is right for the responder. The calling party (flipmode) sends
++	 * the XID command, so swap the bits there. */
++	if (s->flipmode) {
++		comp = ((comp & 1) << 1) | ((comp & 2) >> 1);
++	}
++	s->v42bis = v42bis_init(NULL, comp, dict_size, max_string,
++		v42bis_encode_put, s, sizeof(s->v42bis_txqueue),
++		v42bis_decode_put, v42bis_user_data, V42BIS_MAX_OUTPUT_LENGTH);
++	if (!s->v42bis) {
++		/* The peer will compress anyway, so plain V.42 is no fallback */
++		ast_log(LOG_WARNING, "V.42bis negotiated but v42bis_init failed on %s, ending session\n",
++			ast_channel_name(s->chan));
++		s->v42bis_decided = 1;
++		s->finished = 1;
++		return;
++	}
++	ast_verb(2, "V.42bis compression active on %s (comp %d, dict %d, max string %d)\n",
++		ast_channel_name(s->chan), comp, dict_size, max_string);
++}
++
++/*! \brief V.42 iframe_get: called from v42_tx_bit() when LAP-M has room for
++ * data. Must not block (the socket is O_NONBLOCK). Returns the number of
++ * bytes, or 0 for none right now. When the server closed the connection or
++ * the socket failed, s->finished is set and softmodem_drain() sends what is
++ * still queued. */
++static int v42_iframe_get(void *user_data, uint8_t *buf, int max_len)
++{
++	modem_data *tx = (modem_data*) user_data;
++	uint8_t rxbuf[512];
++	int rc, n;
++	int got_any;
++	int budget, want;
++
++	v42bis_maybe_start(tx->session, tx);
++	/* Ending without a codec: nothing more to read from the server */
++	if (tx->session->finished && !tx->session->v42bis) {
++		return 0;
++	}
++
++	if (tx->session->v42bis) {
++		if (tx->session->v42bis_txqueue_len == 0 && !tx->session->finished) {
++			/* Read everything available, then flush once: a flush per
++			 * recv() adds a FLUSH codeword each time, and
++			 * v42bis_compress_flush() silently keeps data back when called
++			 * in the middle of a match. */
++			got_any = 0;
++			/* Never read more than the queue can take in the worst case:
++			 * 2 output bytes per input byte (transparent mode, every byte
++			 * escaped), plus what spandsp holds in its own output buffer.
++			 * A dropped chunk would corrupt the LZW stream. */
++			budget = ((int) sizeof(tx->session->v42bis_txqueue) - tx->session->v42bis_txqueue_len
++				- V42BIS_MAX_OUTPUT_LENGTH - 16) / 2;
++			while (budget > 0) {
++				want = (budget < (int) sizeof(rxbuf)) ? budget : (int) sizeof(rxbuf);
++#ifdef HAVE_OPENSSL
++				if (tx->ssl) {
++					rc = SSL_read(tx->ssl, rxbuf, want);
++				} else
++#endif
++				{
++					rc = recv(tx->sock, rxbuf, want, 0);
++				}
++				if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++					break;
++				}
++				if (rc <= 0) {
++					tx->session->finished = 1;
++					break;
++				}
++				v42bis_compress(tx->session->v42bis, rxbuf, rc);
++				got_any = 1;
++				budget -= rc;
++			}
++			if (got_any) {
++				v42bis_compress_flush(tx->session->v42bis);
++			}
++		}
++		n = tx->session->v42bis_txqueue_len;
++		if (n > max_len) {
++			n = max_len;
++		}
++		if (n > 0) {
++			memcpy(buf, tx->session->v42bis_txqueue, n);
++			tx->session->v42bis_txqueue_len -= n;
++			memmove(tx->session->v42bis_txqueue, tx->session->v42bis_txqueue + n, tx->session->v42bis_txqueue_len);
++		}
++		return n;
++	}
++
++#ifdef HAVE_OPENSSL
++	if (tx->ssl) {
++		rc = SSL_read(tx->ssl, buf, max_len);
++	} else
++#endif
++	{
++		rc = recv(tx->sock, buf, max_len, 0);
++	}
++	if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++		return 0;
++	}
++	if (rc <= 0) {
++		tx->session->finished = 1;
++		return 0;
++	}
++	return rc;
++}
++
++/*! \brief V.42 iframe_put: called from v42_rx_bit() with the data of an
++ * in-order, error-free I-frame; decompressed first if V.42bis runs. */
++static void v42_iframe_put(void *user_data, const uint8_t *frame, int len)
++{
++	modem_data *rx = (modem_data*) user_data;
++
++	v42bis_maybe_start(rx->session, rx);
++	/* The session is ending (server gone, or no codec for compressed data) */
++	if (rx->session->finished) {
++		return;
++	}
++
++	if (rx->session->v42bis) {
++		int rc = v42bis_decompress(rx->session->v42bis, frame, len);
++		if (rc != 0) {
++			/* Invalid codeword: the dictionaries are out of sync and
++			 * everything after it would be garbage */
++			ast_log(LOG_WARNING, "v42bis_decompress returned %d on %s, ending session\n", rc, ast_channel_name(rx->session->chan));
++			rx->session->finished = 1;
++			return;
++		}
++		/* Without a flush, a single keystroke stays in spandsp's output
++		 * buffer and never reaches the server */
++		v42bis_decompress_flush(rx->session->v42bis);
++		return;
++	}
++	socket_write_all(rx, frame, len);
++}
++
++/*! \brief Forwards spandsp's span_log() output (V.22bis training, V.42 frame
++ * trace) to the Asterisk debug log: core set debug 1 app_softmodem.so */
++static void spandsp_log_handler(int level, const char *text)
++{
++	ast_debug(1, "spandsp: %s", text);
++}
++
++/*! \brief V.42 status callback: switches between V.42 and async framing */
++static void v42_status_handler(void *user_data, int status)
++{
++	modem_session *s = (modem_session*) user_data;
++	const char *str = lapm_status_to_str(status);
++
++	/* lapm_status_to_str() only knows the LAPM_* states, not the generic
++	 * SIG_STATUS_* codes this callback also gets, so log the number too */
++	ast_verb(3, "V.42 status on %s: %s (%d)\n", ast_channel_name(s->chan), str, status);
++	if (!strcmp(str, "LAPM_V42_UNSUPPORTED")) {
++		ast_verb(2, "V.42 not supported by peer on %s, falling back to raw mode\n", ast_channel_name(s->chan));
++		s->v42mode = V42_MODE_FALLBACK;
++		/* Data queued during V.42 detection (the server's banner) would
++		 * otherwise start back to back right away, and a modem receiver can
++		 * lock onto a wrong start bit until the first pause */
++		s->raw_idle_bits = (s->v22_modem ? v22bis_get_current_bit_rate(s->v22_modem) : 1200) * RAW_IDLE_MS / 1000;
++	} else if (status == SIG_STATUS_LINK_CONNECTED) {
++		ast_verb(2, "V.42 error correction active on %s\n", ast_channel_name(s->chan));
++		/* Training has finished by now, so the timers get the final rate
++		 * (see v42_or_raw_put_bit()) */
++		if (s->v22_modem) {
++			s->v42.tx_bit_rate = v22bis_get_current_bit_rate(s->v22_modem);
++			ast_verb(3, "V.42 timers set for %d bit/s on %s\n", s->v42.tx_bit_rate, ast_channel_name(s->chan));
++		}
++		s->v42mode = V42_MODE_ACTIVE;
++	} else if (status == SIG_STATUS_LINK_DISCONNECTED && s->v42mode == V42_MODE_ACTIVE) {
++		/* Released by our DISC (softmodem_drain()) or by the modem's: either
++		 * way the session ends */
++		ast_verb(2, "V.42 link released on %s\n", ast_channel_name(s->chan));
++		s->v42mode = V42_MODE_RELEASED;
++		s->finished = 1;
++	}
++}
++
++/*! \brief Receive bit callback with option 'c': passes each bit to V.42 or to
++ * the async framing, depending on v42mode */
++static void v42_or_raw_put_bit(void *user_data, int bit)
++{
++	modem_data *rx = (modem_data*) user_data;
++	modem_session *s = rx->session;
++
++	if (bit == SIG_STATUS_CARRIER_UP) {
++		rx->state->answertone = 0;
++		if (s->v42mode == V42_MODE_OFF) {
++			/* v42.c counts its timers in bits; v42_init() assumes 28800
++			 * bit/s, which made every timer 12 times too long at 2400.
++			 * Set the current rate before v42_restart() starts T400.
++			 * (v42_start() is declared but not exported by libspandsp.) */
++			if (s->v22_modem) {
++				s->v42.tx_bit_rate = v22bis_get_current_bit_rate(s->v22_modem);
++				ast_verb(3, "V.42 timers set for %d bit/s on %s\n", s->v42.tx_bit_rate, ast_channel_name(s->chan));
++			}
++			v42_restart(&s->v42);
++			s->v42mode = V42_MODE_NEGOTIATING;
++		}
++		return;
++	}
++	if (bit != 0 && bit != 1) {
++		return;
++	}
++
++	if (s->v42mode == V42_MODE_FALLBACK || s->v42mode == V42_MODE_OFF) {
++		modem_put_bit(user_data, bit);
++		return;
++	}
++	v42_rx_bit(&s->v42, bit);
++}
++
+ static void tdd_put_msg(void *user_data, const unsigned char *msg, int len)
+ {
+ 	modem_data *rx = (modem_data*) user_data;
+@@ -593,6 +948,24 @@
+ 	}
+ }
+ 
++/*! \brief Transmit bit callback with option 'c', the counterpart of
++ * v42_or_raw_put_bit() */
++static int v42_or_raw_get_bit(void *user_data)
++{
++	modem_data *tx = (modem_data*) user_data;
++	modem_session *s = tx->session;
++
++	if (s->v42mode == V42_MODE_FALLBACK || s->v42mode == V42_MODE_OFF) {
++		/* Idle marks before the first async data, see v42_status_handler() */
++		if (s->raw_idle_bits > 0 && tx->writepos == tx->readpos) {
++			s->raw_idle_bits--;
++			return 1;
++		}
++		return modem_get_bit(user_data);
++	}
++	return v42_tx_bit(&s->v42);
++}
++
+ static void *modem_generator_alloc(struct ast_channel *chan, void *params)
+ {
+ 	return params;
+@@ -805,6 +1178,85 @@
+ 	return 0;
+ }
+ 
++/* softmodem_drain() limits: time without progress while sending what is
++ * still queued, time to wait for the answer to DISC, idle carrier after the
++ * last data (softmodems lag behind the line; 0.5 s lost the last line on
++ * one), and the silence before hanging up. */
++#define DRAIN_STALL_MS		5000
++#define DRAIN_DISC_MS		3000
++#define DRAIN_TAIL_MS		1500
++#define DRAIN_SILENCE_MS	2000
++
++/*! \brief Ends a V.22/V.22bis call cleanly after the session finished: with
++ * V.42, send what is still queued (as long as the modem keeps acknowledging),
++ * then DISC, and wait for UA/DM; then, in every mode, keep an idle carrier for
++ * DRAIN_TAIL_MS and send silence before the caller hangs up the channel.
++ * Hanging up straight away lost the last data and left some modems online,
++ * printing line noise.
++ * Returns -1 if the channel hung up meanwhile, 0 otherwise. */
++static int softmodem_drain(modem_session *s, v22bis_state_t *v22_modem)
++{
++	struct timeval start = ast_tvnow();
++	struct ast_frame *inf;
++	struct ast_silence_generator *silgen;
++	int disc_sent = 0;
++	int tail_started = 0;
++	int last_va = -1;
++	int last_queue = -1;
++	int elapsed, res;
++
++	for (;;) {
++		elapsed = ast_tvdiff_ms(ast_tvnow(), start);
++		if (s->v42mode == V42_MODE_ACTIVE && !disc_sent) {
++			if (s->v42.lapm.va != last_va || s->v42bis_txqueue_len != last_queue) {
++				/* Still progressing: restart the stall timeout */
++				last_va = s->v42.lapm.va;
++				last_queue = s->v42bis_txqueue_len;
++				start = ast_tvnow();
++				elapsed = 0;
++			}
++			if (elapsed >= DRAIN_STALL_MS || (s->v42bis_txqueue_len == 0
++				&& s->v42.lapm.info_acked == s->v42.lapm.info_put)) {
++				if (elapsed >= DRAIN_STALL_MS) {
++					ast_log(LOG_WARNING, "V.42 data not acknowledged for %d ms on %s, dropping the rest\n",
++						DRAIN_STALL_MS, ast_channel_name(s->chan));
++				}
++				ast_verb(3, "Sending V.42 DISC on %s\n", ast_channel_name(s->chan));
++				v42_stop(&s->v42);
++				disc_sent = 1;
++				start = ast_tvnow();
++			}
++		} else if (s->v42mode == V42_MODE_ACTIVE && elapsed < DRAIN_DISC_MS) {
++			/* Waiting for UA/DM */
++		} else if (!tail_started) {
++			if (s->v42mode == V42_MODE_ACTIVE) {
++				ast_verb(3, "No answer to V.42 DISC on %s\n", ast_channel_name(s->chan));
++			}
++			tail_started = 1;
++			start = ast_tvnow();
++		} else if (elapsed >= DRAIN_TAIL_MS) {
++			break;
++		}
++		if (ast_waitfor(s->chan, 20) < 0) {
++			return -1;
++		}
++		inf = ast_read(s->chan);
++		if (!inf) {
++			return -1;
++		}
++		if (inf->frametype == AST_FRAME_VOICE && inf->subclass.format == ast_format_slin) {
++			v22bis_rx(v22_modem, inf->data.ptr, inf->samples);
++		}
++		ast_frfree(inf);
++	}
++
++	ast_deactivate_generator(s->chan);
++	silgen = ast_channel_start_silence_generator(s->chan);
++	res = ast_safe_sleep(s->chan, DRAIN_SILENCE_MS);
++	ast_channel_stop_silence_generator(s->chan, silgen);
++	return res ? -1 : 0;
++}
++
+ /*!
+  * \internal
+  * \retval -1 on error or hangup after connection
+@@ -868,6 +1320,11 @@
+ 
+ 	server.sin_family = AF_INET;
+ 	hp = ast_gethostbyname(s->host, &ahp);
++	if (!hp) {
++		ast_log(LOG_ERROR, "Cannot resolve host '%s'\n", s->host);
++		close(sock);
++		return 1;
++	}
+ 	memcpy((char *) &server.sin_addr, hp->h_addr, hp->h_length);
+ 	server.sin_port = htons(s->port);
+ 
+@@ -876,6 +1333,7 @@
+ 
+ 	if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
+ 		ast_log(LOG_ERROR, "Cannot connect to remote host '%s': %s\n", s->host, strerror(errno));
++		close(sock);
+ 		ast_autoservice_stop(s->chan);
+ 		return 1;
+ 	}
+@@ -994,10 +1452,39 @@
+ 	} else if (s->version == VERSION_BELL202) {
+ 		modem_tx = fsk_tx_init(NULL, &preset_fsk_specs[FSK_BELL202], modem_get_bit, &txdata);
+ 		modem_rx = fsk_rx_init(NULL, &preset_fsk_specs[FSK_BELL202], FSK_FRAME_MODE_SYNC, modem_put_bit, &rxdata);
+-	} else if (s->version == VERSION_V22) {
+-		v22_modem = v22bis_init(NULL, 1200, 0, s->flipmode, modem_get_bit, &txdata, modem_put_bit, &rxdata);
+-	} else if (s->version == VERSION_V22BIS) {
+-		v22_modem = v22bis_init(NULL, 2400, 0, s->flipmode, modem_get_bit, &txdata, modem_put_bit, &rxdata);
++	} else if (s->version == VERSION_V22 || s->version == VERSION_V22BIS) {
++		int baud = (s->version == VERSION_V22BIS) ? 2400 : 1200;
++		if (s->use_v42) {
++			/* One V.42 context for both directions; it takes over from the
++			 * async framing at carrier up (v42_or_raw_put_bit()). flipmode
++			 * set means we call, as for v22bis_init() below. */
++			s->v42mode = V42_MODE_OFF;
++			v42_init(&s->v42, s->flipmode, 1, v42_iframe_get, v42_iframe_put, &txdata);
++			v42_set_status_callback(&s->v42, v42_status_handler, s);
++			/* Frame level trace, only with debug on (spandsp formats every
++			 * line it logs). A per-instance handler, because
++			 * res_fax_spandsp clears spandsp's global message handler. */
++			if (DEBUG_ATLEAST(1)) {
++				span_log_set_level(&s->v42.logging, SPAN_LOG_FLOW | SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_PROTOCOL);
++				span_log_set_message_handler(&s->v42.logging, spandsp_log_handler);
++			}
++			/* What our XIDs request. Needed in both cases: v42_init() sets
++			 * comp = 1, so without an explicit "neither direction" 'c' alone
++			 * would still accept V.42bis that this side never runs. */
++			v42_set_local_v42bis_request(&s->v42,
++				s->use_v42bis ? V42BIS_P0_BOTH_DIRECTIONS : V42BIS_P0_NEITHER_DIRECTION,
++				V42BIS_MAX_CODEWORDS, V42BIS_MAX_STRING_SIZE);
++			v22_modem = v22bis_init(NULL, baud, 0, s->flipmode, v42_or_raw_get_bit, &txdata, v42_or_raw_put_bit, &rxdata);
++			s->v22_modem = v22_modem;
++		} else {
++			v22_modem = v22bis_init(NULL, baud, 0, s->flipmode, modem_get_bit, &txdata, modem_put_bit, &rxdata);
++		}
++		/* Training trace (S1 detection, rates), only with debug on */
++		if (v22_modem && DEBUG_ATLEAST(1)) {
++			logging_state_t *v22log = v22bis_get_logging_state(v22_modem);
++			span_log_set_level(v22log, SPAN_LOG_FLOW | SPAN_LOG_SHOW_SEVERITY | SPAN_LOG_SHOW_PROTOCOL);
++			span_log_set_message_handler(v22log, spandsp_log_handler);
++		}
+ 	} else if (s->version == VERSION_V18_45 || s->version == VERSION_V18_50) {
+ 		fsk_rx_state_t *fs = NULL;
+ 		/* This softmodem is the called side, so answerer mode */
+@@ -1146,7 +1633,14 @@
+ 		inf = NULL;
+ 	}
+ 
++	if (res == 0 && s->finished && (s->version == VERSION_V22 || s->version == VERSION_V22BIS)) {
++		res = softmodem_drain(s, v22_modem);
++	}
++
+ cleanup:
++	/* The modem objects below are the generator's data, and the channel is
++	 * still up when the TCP side ended the session: stop it before freeing */
++	ast_deactivate_generator(s->chan);
+ 	close(sock);
+ #ifdef HAVE_OPENSSL
+ 	if (ssl) {
+@@ -1158,6 +1652,14 @@
+ 	if (s->version == VERSION_V22 || s->version == VERSION_V22BIS) {
+ 		v22bis_release(v22_modem);
+ 		v22bis_free(v22_modem);
++		if (s->use_v42) {
++			/* No v42_free(): s->v42 is embedded in the session (on the stack) */
++			v42_release(&s->v42);
++			if (s->v42bis) {
++				v42bis_release(s->v42bis);
++				v42bis_free(s->v42bis);
++			}
++		}
+ 	} else if (s->version == VERSION_V18_45 || s->version == VERSION_V18_50) {
+ 		v18_release(v18_modem);
+ 		v18_free(v18_modem);
+@@ -1204,7 +1706,8 @@
+ 		return res;
+ 	}
+ 
+-	/* Set defaults */
++	/* Set defaults; everything not set here is zero */
++	memset(&session, 0, sizeof(session));
+ 	session.chan = chan;
+ 	session.finished = 0;
+ 	session.rxcutoff = -35.0f;
+@@ -1317,6 +1820,20 @@
+ 			session.sendnull = 1;
+ 		}
+ 		session.flipmode = ast_test_flag(&options, OPT_FLIP_MODE) ? 1 : 0;
++		if (ast_test_flag(&options, OPT_V42)) {
++			if (session.version != VERSION_V22 && session.version != VERSION_V22BIS) {
++				ast_log(LOG_WARNING, "V.42 (option c) is only supported for V22/V22bis, ignoring\n");
++			} else {
++				session.use_v42 = 1;
++			}
++		}
++		if (ast_test_flag(&options, OPT_V42BIS)) {
++			if (!session.use_v42) {
++				ast_log(LOG_WARNING, "V.42bis (option b) requires V.42 (option c), ignoring\n");
++			} else {
++				session.use_v42bis = 1;
++			}
++		}
+ 	}
+ 
+ 	session.track_session = 1;

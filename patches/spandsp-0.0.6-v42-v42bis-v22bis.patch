@@ -1,0 +1,738 @@
+--- a/src/v42.c
++++ b/src/v42.c
+@@ -46,6 +46,7 @@
+ #include "spandsp/async.h"
+ #include "spandsp/hdlc.h"
+ #include "spandsp/v42.h"
++#include "spandsp/v42bis.h"
+ 
+ #include "spandsp/private/logging.h"
+ #include "spandsp/private/hdlc.h"
+@@ -54,8 +55,10 @@
+ #define FALSE 0
+ #define TRUE (!FALSE)
+ 
+-/* Detection phase timer */
+-#define T_400                           750
++/* Detection phase timer. V.42 says 750 ms, but T400 starts at V.22bis
++   carrier up, before the 2400 bit/s training; real modems send their ODP
++   0.7-1.1 s after that, and our 10 ADPs must also fit inside T400. */
++#define T_400                           2000
+ /* Acknowledgement timer - 1 second between SABME's */
+ #define T_401                           1000
+ /* Replay delay timer (optional) */
+@@ -268,27 +271,188 @@
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
++/* Keeps our own V.42bis request inside what v42bis_init() accepts. The
++   negotiated values are the smaller of this and the (range checked) peer
++   offer, so they stay inside too. */
++static void clamp_v42bis_config(v42_config_parameters_t *config)
++{
++    if (config->comp_dict_size < V42BIS_MIN_DICTIONARY_SIZE)
++        config->comp_dict_size = V42BIS_MIN_DICTIONARY_SIZE;
++    else if (config->comp_dict_size > V42BIS_MAX_CODEWORDS)
++        config->comp_dict_size = V42BIS_MAX_CODEWORDS;
++    if (config->comp_max_string < V42BIS_MIN_STRING_SIZE)
++        config->comp_max_string = V42BIS_MIN_STRING_SIZE;
++    else if (config->comp_max_string > V42BIS_MAX_STRING_SIZE)
++        config->comp_max_string = V42BIS_MAX_STRING_SIZE;
++}
++/*- End of function --------------------------------------------------------*/
++
++/* Stores the V.42bis parameters receive_xid() parsed (stock spandsp left
++   this call commented out and dropped them). V.42bis 5.1: a direction is
++   compressed only if both sides asked for it, and P1/P2 are the smaller of
++   the two offers. receive_xid() has checked the peer's values. */
++static void v42_update_config(v42_state_t *ss, const v42_config_parameters_t *config)
++{
++    ss->config.comp &= config->comp;
++    if (config->comp_dict_size < ss->config.comp_dict_size)
++        ss->config.comp_dict_size = config->comp_dict_size;
++    if (config->comp_max_string < ss->config.comp_max_string)
++        ss->config.comp_max_string = config->comp_max_string;
++    ss->v42bis_negotiated = TRUE;
++}
++/*- End of function --------------------------------------------------------*/
++
++/* Hex dump of a frame (address, control, info; no FCS), for XID interop
++   problems. */
++static void log_frame_hex(v42_state_t *ss, const char *tag, const uint8_t *frame, int len)
++{
++    char hex[3*64 + 1];
++    int i;
++    int n;
++
++    n = (len > 64)  ?  64  :  len;
++    for (i = 0;  i < n;  i++)
++        snprintf(&hex[3*i], 4, "%02x ", frame[i]);
++    hex[3*n] = '\0';
++    span_log(&ss->logging, SPAN_LOG_FLOW, "%s (%d bytes): %s\n", tag, len, hex);
++}
++/*- End of function --------------------------------------------------------*/
++
++/* One trace line per LAPM frame, rx and tx. C/R as in lapm_receive(): a
++   received frame to rsp_addr or a sent frame to cmd_addr is a command. */
++static void log_frame_trace(v42_state_t *ss, int tx, const uint8_t *frame, int len)
++{
++    static const char *s_names[4] = {"RR", "RNR", "REJ", "SREJ"};
++    lapm_state_t *s;
++    const char *dir;
++    const char *cr;
++    const char *u_name;
++
++    s = &ss->lapm;
++    dir = (tx)  ?  "tx"  :  "rx";
++    if (len < 2)
++    {
++        span_log(&ss->logging, SPAN_LOG_FLOW, "%s frame too short (%d bytes)\n", dir, len);
++        return;
++    }
++    cr = (frame[0] == ((tx)  ?  s->cmd_addr  :  s->rsp_addr))  ?  "cmd"  :  "rsp";
++    if ((frame[1] & 0x01) == 0)
++    {
++        span_log(&ss->logging, SPAN_LOG_FLOW, "%s I ns=%d nr=%d p=%d info=%d | vs=%d va=%d vr=%d\n",
++                 dir, frame[1] >> 1, (len > 2)  ?  frame[2] >> 1  :  -1, (len > 2)  ?  frame[2] & 1  :  -1,
++                 len - 3, s->vs, s->va, s->vr);
++        return;
++    }
++    if ((frame[1] & LAPM_FRAMETYPE_MASK) == LAPM_FRAMETYPE_S)
++    {
++        span_log(&ss->logging, SPAN_LOG_FLOW, "%s %s %s nr=%d pf=%d | vs=%d va=%d vr=%d\n",
++                 dir, s_names[(frame[1] & 0x0C) >> 2], cr, (len > 2)  ?  frame[2] >> 1  :  -1,
++                 (len > 2)  ?  frame[2] & 1  :  -1, s->vs, s->va, s->vr);
++        return;
++    }
++    switch (frame[1] & 0xEC)
++    {
++    case LAPM_U_UI:     u_name = "UI";     break;
++    case LAPM_U_DM:     u_name = "DM";     break;
++    case LAPM_U_DISC:   u_name = "DISC";   break;
++    case LAPM_U_UA:     u_name = "UA";     break;
++    case LAPM_U_SABME:  u_name = "SABME";  break;
++    case LAPM_U_FRMR:   u_name = "FRMR";   break;
++    case LAPM_U_XID:    u_name = "XID";    break;
++    case LAPM_U_TEST:   u_name = "TEST";   break;
++    default:            u_name = "U?";     break;
++    }
++    span_log(&ss->logging, SPAN_LOG_FLOW, "%s %s %s pf=%d len=%d\n",
++             dir, u_name, cr, (frame[1] & LAPM_U_PF)  ?  1  :  0, len);
++}
++/*- End of function --------------------------------------------------------*/
++
++/* Check that every group and parameter of an XID lies inside the frame
++   before receive_xid() touches any state. (The stock parser used uint16_t
++   lengths, so its "< 0" overrun checks never fired.) */
++static int xid_well_formed(const uint8_t *frame, int len)
++{
++    int group_id;
++    int group_len;
++    int param_len;
++
++    if (len < 3)
++        return FALSE;
++    frame += 3;
++    len -= 3;
++    while (len > 0)
++    {
++        /* The user data subfield (ISO/IEC 8885) has no group length and runs
++           to the end of the frame. Conexant modems put their V.44 offer
++           there; we do not do V.44, so it is ignored. */
++        if (frame[0] == GI_USER_DATA)
++            return TRUE;
++        if (len < 3)
++            return FALSE;
++        group_id = frame[0];
++        group_len = (frame[1] << 8) | frame[2];
++        frame += 3;
++        len -= 3;
++        if (group_len > len)
++            return FALSE;
++        len -= group_len;
++        if (group_id != GI_PARAM_NEGOTIATION  &&  group_id != GI_PRIVATE_NEGOTIATION)
++        {
++            /* Not parsed by receive_xid(), only skipped */
++            frame += group_len;
++            continue;
++        }
++        while (group_len > 0)
++        {
++            if (group_len < 2)
++                return FALSE;
++            param_len = frame[1];
++            frame += 2;
++            group_len -= 2;
++            if (param_len > group_len)
++                return FALSE;
++            frame += param_len;
++            group_len -= param_len;
++        }
++    }
++    return TRUE;
++}
++/*- End of function --------------------------------------------------------*/
++
+ static int receive_xid(v42_state_t *ss, const uint8_t *frame, int len)
+ {
+     lapm_state_t *s;
+     v42_config_parameters_t config;
+     const uint8_t *buf;
+     uint8_t group_id;
+-    uint16_t group_len;
++    int group_len;
+     uint32_t param_val;
+     uint8_t param_id;
+     uint8_t param_len;
++    int got_v42bis_params;
+ 
+     s = &ss->lapm;
++    if (!xid_well_formed(frame, len))
++    {
++        span_log(&ss->logging, SPAN_LOG_FLOW, "receive_xid: malformed XID (%d bytes), ignored\n", len);
++        return -1;
++    }
+     if (frame[2] != FI_GENERAL)
+         return -1;
+     memset(&config, 0, sizeof(config));
++    /* V.42bis defaults for parameters the XID leaves out */
++    config.comp_dict_size = V42BIS_MIN_DICTIONARY_SIZE;
++    config.comp_max_string = V42BIS_MIN_STRING_SIZE;
++    got_v42bis_params = FALSE;
+     /* Skip the header octets */
+     frame += 3;
+     len -= 3;
+     while (len > 0)
+     {
+         group_id = frame[0];
++        /* User data subfield: no length, runs to the end (see xid_well_formed()) */
++        if (group_id == GI_USER_DATA)
++            break;
+         group_len = frame[1];
+         group_len = (group_len << 8) | frame[2];
+         frame += 3;
+@@ -357,12 +521,15 @@
+                     break;
+                 case PI_V42BIS_COMPRESSION_REQUEST:
+                     config.comp = pack_value(buf, param_len);
++                    got_v42bis_params = TRUE;
+                     break;
+                 case PI_V42BIS_NUM_CODEWORDS:
+                     config.comp_dict_size = pack_value(buf, param_len);
++                    got_v42bis_params = TRUE;
+                     break;
+                 case PI_V42BIS_MAX_STRING_LENGTH:
+                     config.comp_max_string = pack_value(buf, param_len);
++                    got_v42bis_params = TRUE;
+                     break;
+                 default:
+                     break;
+@@ -374,7 +541,35 @@
+             break;
+         }
+     }
+-    //v42_update_config(ss, &config);
++    /* Apply V.42bis values only from an XID that carries them: a later XID
++       that only renegotiates window/N401 must not cancel compression agreed
++       at link setup. */
++    span_log(&ss->logging, SPAN_LOG_FLOW, "receive_xid: peer requested v42bis=%s (comp=%d, dict=%d, maxstr=%d), our config.comp before this frame was %d\n",
++             got_v42bis_params ? "yes" : "no", config.comp, config.comp_dict_size, config.comp_max_string, ss->config.comp);
++    /* Out of range values are a protocol error (V.42bis 5.1): do not answer */
++    if (got_v42bis_params
++        &&
++        (config.comp > V42BIS_P0_BOTH_DIRECTIONS
++         ||  config.comp_dict_size < V42BIS_MIN_DICTIONARY_SIZE  ||  config.comp_dict_size > 65535
++         ||  config.comp_max_string < V42BIS_MIN_STRING_SIZE  ||  config.comp_max_string > V42BIS_MAX_STRING_SIZE))
++    {
++        span_log(&ss->logging, SPAN_LOG_FLOW, "receive_xid: V.42bis parameters out of range, ignored\n");
++        return -1;
++    }
++    if (got_v42bis_params)
++    {
++        v42_update_config(ss, &config);
++    }
++    else if (s->state == LAPM_IDLE)
++    {
++        /* Link setup and no V.42bis group: an absent parameter means its
++           default, P0 = 0 (neither direction). Otherwise our XID response
++           would offer compression to a peer that never asked for it. */
++        config.comp = V42BIS_P0_NEITHER_DIRECTION;
++        config.comp_dict_size = ss->config.comp_dict_size;
++        config.comp_max_string = ss->config.comp_max_string;
++        v42_update_config(ss, &config);
++    }
+     return 0;
+ }
+ /*- End of function --------------------------------------------------------*/
+@@ -390,7 +585,10 @@
+ 
+     s = &ss->lapm;
+     if ((f = get_next_free_ctrl_frame(s)) == NULL)
++    {
++        span_log(&ss->logging, SPAN_LOG_FLOW, "transmit_xid: NO FREE CTRL FRAME, reply silently dropped (ctrl_put=%d, ctrl_get=%d)\n", s->ctrl_put, s->ctrl_get);
+         return;
++    }
+ 
+     buf = f->buf;
+     len = 0;
+@@ -403,7 +601,8 @@
+     len += 3;
+ 
+     /* Parameter negotiation group */
+-    group_len = 20;
++    /* 19, not 20: the HDLC optional functions field below has 3 octets */
++    group_len = 19;
+     *buf++ = GI_PARAM_NEGOTIATION;
+     *buf++ = (group_len >> 8) & 0xFF;
+     *buf++ = group_len & 0xFF;
+@@ -418,12 +617,13 @@
+         Extended FCS procedure (32-bit FCS)
+         24 Selective retransmission procedure (SREJ frame) multiple I frame request with span list
+            capability. */
++    /* 3 octets (bits 1-24) as real modems and slmodem send them, not 4.
++       Rockwell modems ignore an XID response with 4 and never send SABME. */
+     *buf++ = PI_HDLC_OPTIONAL_FUNCTIONS;
+-    *buf++ = 4;
++    *buf++ = 3;
+     *buf++ = 0x8A;  /* Bits 2, 4, and 8 set */
+     *buf++ = 0x89;  /* Bits 9, 12, and 16 set */
+     *buf++ = 0x00;
+-    *buf++ = 0x00;
+ 
+     /* Send the maximum as a number of bits, rather than octets */
+     param_val = ss->config.v42_tx_n401 << 3;
+@@ -449,7 +649,8 @@
+ 
+     len += group_len;
+ 
+-    if (ss->config.comp)
++    /* Always send the V.42bis group, with P0 = 0 when we decline. Rockwell
++       modems take a missing group as acceptance of their own proposal. */
+     {
+         /* Private parameter negotiation group */
+         group_len = 15;
+@@ -491,6 +692,7 @@
+     }
+ 
+     f->len = len;
++    log_frame_hex(ss, "tx XID", f->buf, len);
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -503,6 +705,8 @@
+ static void t400_expired(v42_state_t *ss)
+ {
+     /* Give up trying to detect a V.42 capable peer. */
++    span_log(&ss->logging, SPAN_LOG_FLOW, "T.400 expired -- giving up on V.42 detection (odp_seen=%d, txadps=%d, rx_negotiation_step=%d)\n",
++             ss->neg.odp_seen, ss->neg.txadps, ss->neg.rx_negotiation_step);
+     ss->bit_timer = 0;
+     ss->lapm.state = LAPM_V42_UNSUPPORTED;
+     report_rx_status_change(ss, ss->lapm.state);
+@@ -659,8 +863,11 @@
+     s = &ss->lapm;
+     /* Respond with information frame, RR, or RNR, as appropriate */
+     /* p = 1 may be used for status checking */
++    /* F must echo the received P bit. Stock spandsp always set F = 1;
++       Rockwell modems ignore such unsolicited final responses, so uploads
++       only advanced on their T401 retransmissions. */
+     if ((frame[2] & 0x1)  ||  !tx_information_frame(ss))
+-        tx_supervisory_frame(s, frame[0], (s->local_busy)  ?  LAPM_S_RNR  :  LAPM_S_RR, 1);
++        tx_supervisory_frame(s, frame[0], (s->local_busy)  ?  LAPM_S_RNR  :  LAPM_S_RR, frame[2] & 0x1);
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -764,6 +971,20 @@
+     /* NS sequence error */
+     if ((frame[1] >> 1) != s->vr)
+     {
++        /* N(S) in [V(R) - k, V(R) - 1]: a retransmission of a frame we already
++           accepted. Discard it without REJ: a REJ makes the peer go back and
++           resend frames that are already on the way, which arrive as
++           duplicates again, so every frame ends up sent twice. */
++        if (((s->vr - (frame[1] >> 1)) & 0x7F) <= s->rx_window_size_k)
++        {
++            span_log(&ss->logging, SPAN_LOG_FLOW, "rx I duplicate: ns=%d, vr=%d, discarded\n",
++                     frame[1] >> 1, s->vr);
++            if ((frame[2] & 0x1))
++                tx_supervisory_frame(s, s->rsp_addr, LAPM_S_RR, 1);
++            return;
++        }
++        span_log(&ss->logging, SPAN_LOG_FLOW, "rx I out of sequence: ns=%d, expected vr=%d, %s\n",
++                 frame[1] >> 1, s->vr, (s->rejected)  ?  "REJ already sent"  :  "sending REJ");
+         if (!s->rejected)
+         {
+             tx_supervisory_frame(s, s->rsp_addr, LAPM_S_REJ, (frame[2] & 0x1));
+@@ -873,6 +1094,8 @@
+     lapm_state_t *s;
+ 
+     s = &ss->lapm;
++    if ((frame[1] & 0xEC) == LAPM_U_XID)
++        log_frame_hex(ss, "rx XID", frame, len);
+     switch (frame[1] & 0xEC)
+     {
+     case LAPM_U_SABME:
+@@ -908,8 +1131,9 @@
+         }
+         break;
+     case LAPM_U_XID:
+-        /* Exchange general ID info */
+-        receive_xid(ss, frame, len);
++        /* Exchange general ID info. Do not answer an XID we could not parse. */
++        if (receive_xid(ss, frame, len) < 0)
++            break;
+         transmit_xid(ss, s->rsp_addr);
+         break;
+     case LAPM_U_TEST:
+@@ -996,7 +1220,8 @@
+     case LAPM_U_XID:
+         if (s->configuring)
+         {
+-            receive_xid(ss, frame, len);
++            if (receive_xid(ss, frame, len) < 0)
++                break;
+             s->configuring = FALSE;
+             t401_stop(ss);
+             switch (s->state)
+@@ -1057,6 +1282,7 @@
+         if (ss->bit_timer == 0)
+             t401_start(ss);
+     }
++    log_frame_trace(ss, TRUE, f->buf, f->len);
+     hdlc_tx_frame(&s->hdlc_tx, f->buf, f->len);
+ }
+ /*- End of function --------------------------------------------------------*/
+@@ -1074,7 +1300,18 @@
+         return;
+     }
+     if (!ok)
++    {
++        span_log(&ss->logging, SPAN_LOG_FLOW, "rx bad frame (CRC or length), %d bytes\n", len);
+         return;
++    }
++    /* Address + control at least; I and S frames also carry N(R) in a third
++       octet. The handlers below read those octets without checking. */
++    if (len < 2  ||  ((frame[1] & LAPM_FRAMETYPE_MASK) != LAPM_FRAMETYPE_U  &&  len < 3))
++    {
++        span_log(&ss->logging, SPAN_LOG_FLOW, "rx frame too short (%d bytes), ignored\n", len);
++        return;
++    }
++    log_frame_trace(ss, FALSE, frame, len);
+ 
+     switch ((frame[1] & LAPM_FRAMETYPE_MASK))
+     {
+@@ -1163,6 +1400,8 @@
+     s->vs = 0;
+     s->va = 0;
+     s->vr = 0;
++    /* A REJ condition from before the reset must not suppress the first REJ after it */
++    s->rejected = FALSE;
+     /* Discard any info frames still queued for transmission */
+     s->info_put = 0;
+     s->info_acked = 0;
+@@ -1313,6 +1552,7 @@
+                 s->neg.rx_negotiation_step++;
+                 if (s->calling_party)
+                 {
++                    span_log(&s->logging, SPAN_LOG_FLOW, "V.42 detect: calling party found answerer's ADP, going straight to IDLE\n");
+                     t400_stop(s);
+                     s->lapm.state = LAPM_IDLE;
+                     report_rx_status_change(s, s->lapm.state);
+@@ -1320,6 +1560,8 @@
+                 }
+                 else
+                 {
++                    span_log(&s->logging, SPAN_LOG_FLOW, "V.42 detect: answerer found calling party's ADP %d ms into T400, starting our own %d ADP repeats\n",
++                             T_400 - s->bit_timer*1000/s->tx_bit_rate, 10);
+                     s->neg.odp_seen = TRUE;
+                 }
+                 /*endif*/
+@@ -1374,6 +1616,7 @@
+             {
+                 if (++s->neg.txadps >= 10)
+                 {
++                    span_log(&s->logging, SPAN_LOG_FLOW, "V.42 detect: answerer finished sending its %d ADP repeats, handing off to LAPM establish\n", s->neg.txadps);
+                     t400_stop(s);
+                     s->lapm.state = LAPM_IDLE;
+                     report_rx_status_change(s, s->lapm.state);
+@@ -1456,6 +1699,33 @@
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
++/* What our XIDs request. Call after v42_init(), before v42_restart(). Does
++   not set v42bis_negotiated: only the peer's XID does that. */
++SPAN_DECLARE(void) v42_set_local_v42bis_request(v42_state_t *s, int comp, int comp_dict_size, int comp_max_string)
++{
++    s->config.comp = comp;
++    s->config.comp_dict_size = comp_dict_size;
++    s->config.comp_max_string = comp_max_string;
++    clamp_v42bis_config(&s->config);
++}
++/*- End of function --------------------------------------------------------*/
++
++/* The negotiated V.42bis parameters. FALSE (out parameters untouched) until
++   an XID from the peer has set them. */
++SPAN_DECLARE(int) v42_get_negotiated_v42bis(v42_state_t *s, int *comp, int *comp_dict_size, int *comp_max_string)
++{
++    if (!s->v42bis_negotiated)
++        return FALSE;
++    if (comp)
++        *comp = s->config.comp;
++    if (comp_dict_size)
++        *comp_dict_size = s->config.comp_dict_size;
++    if (comp_max_string)
++        *comp_max_string = s->config.comp_max_string;
++    return TRUE;
++}
++/*- End of function --------------------------------------------------------*/
++
+ SPAN_DECLARE(void) v42_set_status_callback(v42_state_t *s, modem_status_func_t status_handler, void *user_data)
+ {
+     s->lapm.status_handler = status_handler;
+@@ -1466,7 +1736,8 @@
+ SPAN_DECLARE(void) v42_restart(v42_state_t *s)
+ {
+     hdlc_tx_init(&s->lapm.hdlc_tx, FALSE, 1, TRUE, lapm_hdlc_underflow, s);
+-    hdlc_rx_init(&s->lapm.hdlc_rx, FALSE, FALSE, 1, lapm_receive, s);
++    /* report_bad_frames on, so lapm_receive() can log CRC failures */
++    hdlc_rx_init(&s->lapm.hdlc_rx, FALSE, TRUE, 1, lapm_receive, s);
+ 
+     if (s->detect)
+     {
+--- a/src/spandsp/v42.h
++++ b/src/spandsp/v42.h
+@@ -64,6 +64,23 @@
+ */
+ SPAN_DECLARE(int) v42_get_far_busy_status(v42_state_t *s);
+ 
++/*! Set what our side requests for V.42bis in the XIDs it sends. Call after
++    v42_init(), before v42_restart().
++    \param s The V.42 context.
++    \param comp The V42BIS_P0_* compression direction to request.
++    \param comp_dict_size The dictionary size (codewords) to request.
++    \param comp_max_string The max string length to request. */
++SPAN_DECLARE(void) v42_set_local_v42bis_request(v42_state_t *s, int comp, int comp_dict_size, int comp_max_string);
++
++/*! Get the negotiated V.42bis parameters, once an XID from the peer has
++    set them. (Stock spandsp parses them but discards them.)
++    \param s The V.42 context.
++    \param comp Set to the negotiated V42BIS_P0_* compression direction, if returned TRUE.
++    \param comp_dict_size Set to the negotiated dictionary size (codewords), if returned TRUE.
++    \param comp_max_string Set to the negotiated max string length, if returned TRUE.
++    \return TRUE if the far end's XID has specified V.42bis parameters, FALSE if not (yet). */
++SPAN_DECLARE(int) v42_get_negotiated_v42bis(v42_state_t *s, int *comp, int *comp_dict_size, int *comp_max_string);
++
+ SPAN_DECLARE(void) v42_rx_bit(void *user_data, int bit);
+ 
+ SPAN_DECLARE(int) v42_tx_bit(void *user_data);
+--- a/src/spandsp/private/v42.h
++++ b/src/spandsp/private/v42.h
+@@ -141,6 +141,9 @@
+     int tx_bit_rate;
+ 
+     v42_config_parameters_t config;
++    /*! TRUE once an XID from the peer has set the V.42bis values in config.
++        Before that, config only holds our own request. */
++    int v42bis_negotiated;
+     v42_negotiation_t neg;
+     lapm_state_t lapm;
+ 
+--- a/src/v42bis.c
++++ b/src/v42bis.c
+@@ -248,14 +248,21 @@
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+-static void expand_codeword_to_string(v42bis_comp_state_t *s, uint16_t code)
++/* Returns -1 instead of writing past s->string when the codeword's chain is
++   longer than the string buffer: a corrupt or hostile codeword stream must
++   not run past the buffer or loop forever. */
++static int expand_codeword_to_string(v42bis_comp_state_t *s, uint16_t code)
+ {
+     int i;
+     uint16_t p;
+ 
+     /* Work out the length */
+     for (i = 0, p = code;  p;  i++)
++    {
++        if (s->string_length + i >= (int) sizeof(s->string))
++            return -1;
+         p = s->dict[p].parent;
++    }
+     s->string_length += i;
+     /* Now expand the known length of string */
+     i = s->string_length - 1;
+@@ -264,6 +271,7 @@
+         s->string[i--] = s->dict[p].node_octet;
+         p = s->dict[p].parent;
+     }
++    return 0;
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
+@@ -650,7 +658,11 @@
+                     span_log(&ss->logging, SPAN_LOG_FLOW, "Hit V42BIS_STEPUP\n");
+                     s->v42bis_parm_c2++;
+                     s->v42bis_parm_c3 <<= 1;
+-                    if (s->v42bis_parm_c2 > (s->v42bis_parm_n2 >> 3))
++                    /* Codewords may grow only until they can address N2
++                       entries. The stock check compared against N2 >> 3,
++                       which allowed codewords far wider than the
++                       dictionary. */
++                    if ((1 << (s->v42bis_parm_c2 - 1)) >= s->v42bis_parm_n2)
+                         return -1;
+                     break;
+                 }
+@@ -659,7 +671,10 @@
+             /* Regular codeword */
+             if (code == s->v42bis_parm_c1)
+                 return -1;
+-            expand_codeword_to_string(s, code);
++            if (code >= s->v42bis_parm_n2)
++                return -1;
++            if (expand_codeword_to_string(s, code) < 0)
++                return -1;
+             if (s->update_at)
+             {
+                 ch = s->string[0];
+@@ -721,7 +736,8 @@
+ {
+     int ret;
+ 
+-    if (negotiated_p1 < V42BIS_MIN_DICTIONARY_SIZE  ||  negotiated_p1 > 65535)
++    /* dict[] holds V42BIS_MAX_CODEWORDS entries, not 65535 */
++    if (negotiated_p1 < V42BIS_MIN_DICTIONARY_SIZE  ||  negotiated_p1 > V42BIS_MAX_CODEWORDS)
+         return NULL;
+     if (negotiated_p2 < V42BIS_MIN_STRING_SIZE  ||  negotiated_p2 > V42BIS_MAX_STRING_SIZE)
+         return NULL;
+@@ -758,6 +774,9 @@
+ {
+     comp_exit(&s->compress);
+     comp_exit(&s->decompress);
++    /* Stock 0.0.6 never freed the state that v42bis_init(NULL, ...)
++       allocated (a leak of ~68 KB per call) */
++    free(s);
+     return 0;
+ }
+ /*- End of function --------------------------------------------------------*/
+--- a/src/v22bis_rx.c
++++ b/src/v22bis_rx.c
+@@ -393,6 +393,46 @@
+ }
+ /*- End of function --------------------------------------------------------*/
+ 
++/* Answerer S1 detector based on phase steps. S1 shows up as consecutive phase steps of alternating sign. Before the
++   channel is equalised the S1 points sit only ~57 degrees apart instead of
++   90, so whether the stock 00/11 quadrant check sees any 00/11 pair depends
++   on the call's random carrier phase: it missed a clean S1 in ~40% of calls,
++   which then trained at 1200 bit/s. Worse, the decision-directed carrier
++   tracking and equaliser then adapt to those wrong decisions and shrink the
++   steps further, so the run is counted from symbol acquisition on, where the
++   steps are still clean. The step sign does not depend on the carrier phase.
++   Call once per baud; returns TRUE when a run of >= 15 such steps has just
++   ended (the same end-of-S1 point the 00/11 check fires at). */
++static int track_s1_phase_steps(v22bis_state_t *s, const complexf_t *z)
++{
++    float cross;
++    float dot;
++    float step;
++    int sign;
++    int ended;
++
++    cross = s->rx.s1_prev_z.re*z->im - s->rx.s1_prev_z.im*z->re;
++    dot = s->rx.s1_prev_z.re*z->re + s->rx.s1_prev_z.im*z->im;
++    step = atan2f(cross, dot);
++    sign = (step > 0.0f)  ?  1  :  -1;
++    ended = FALSE;
++    if (fabsf(step) > 0.52f  &&  fabsf(step) < 2.62f  &&  sign == -s->rx.s1_prev_sign)
++    {
++        s->rx.s1_run++;
++    }
++    else
++    {
++        if (s->rx.s1_run >= 15)
++            ended = TRUE;
++        else
++            s->rx.s1_run = 0;
++    }
++    s->rx.s1_prev_sign = sign;
++    s->rx.s1_prev_z = *z;
++    return ended;
++}
++/*- End of function --------------------------------------------------------*/
++
+ static void process_half_baud(v22bis_state_t *s, const complexf_t *sample)
+ {
+     complexf_t z;
+@@ -488,6 +528,10 @@
+     case V22BIS_RX_TRAINING_STAGE_SYMBOL_ACQUISITION:
+         /* Allow time for the Gardner algorithm to settle the symbol timing. */
+         target = &z;
++        /* S1 usually starts right here; an end seen now is reported again by
++           the next call in the S1 search below, as the run is kept. */
++        if (!s->calling_party)
++            track_s1_phase_steps(s, &z);
+         if (++s->rx.training_count >= 40)
+         {
+             /* QAM and Gardner only play nicely with heavy damping, so we need to change to
+@@ -576,18 +620,24 @@
+ //span_log(&s->logging, SPAN_LOG_FLOW, "S11 0x%02x 0x%02x 0x%X %d %d %d %d %d\n", raw_bits, nearest, bitstream, s->rx.scrambled_ones_to_date, 0, 0, 0, s->rx.training_count);
+         if (s->negotiated_bit_rate == 1200)
+         {
++            int s1_by_phase_step;
++
++            s1_by_phase_step = (!s->calling_party  &&  track_s1_phase_steps(s, &z));
+             /* Search for the S1 signal */
+-            if ((s->rx.last_raw_bits ^ raw_bits) == 0x3)
++            if ((s->rx.last_raw_bits ^ raw_bits) == 0x3  &&  !s1_by_phase_step)
+             {
+                 s->rx.pattern_repeats++;
+             }
+             else
+             {
+-                if (s->rx.pattern_repeats >= 15  &&  (s->rx.last_raw_bits == 0x3  ||  s->rx.last_raw_bits == 0x0))
++                if (s1_by_phase_step
++                    ||
++                    (s->rx.pattern_repeats >= 15  &&  (s->rx.last_raw_bits == 0x3  ||  s->rx.last_raw_bits == 0x0)))
+                 {
+                     /* We should get a full run of 00 11 (about 60 bauds) at the calling modem, but only about 20
+                        at the answering modem, as the first 40 are TED settling time. */
+-                    span_log(&s->logging, SPAN_LOG_FLOW, "+++ S1 detected (%d long)\n", s->rx.pattern_repeats);
++                    span_log(&s->logging, SPAN_LOG_FLOW, "+++ S1 detected (00/11 run %d, phase-step run %d, at symbol %d)\n",
++                             s->rx.pattern_repeats, s->rx.s1_run, s->rx.training_count);
+                     if (s->bit_rate == 2400)
+                     {
+                         if (!s->calling_party)
+@@ -601,6 +651,8 @@
+                     }
+                 }
+                 s->rx.pattern_repeats = 0;
++                if (s1_by_phase_step)
++                    s->rx.s1_run = 0;
+             }
+             if (s->rx.training_count >= ms_to_symbols(270))
+             {
+@@ -845,6 +897,9 @@
+     s->rx.training = V22BIS_RX_TRAINING_STAGE_SYMBOL_ACQUISITION;
+     s->rx.training_count = 0;
+     s->rx.signal_present = FALSE;
++    s->rx.s1_prev_z = complex_setf(0.0f, 0.0f);
++    s->rx.s1_prev_sign = 0;
++    s->rx.s1_run = 0;
+ 
+     s->rx.carrier_phase_rate = dds_phase_ratef((s->calling_party)  ?  2400.0f  :  1200.0f);
+     s->rx.carrier_phase = 0;
+--- a/src/spandsp/private/v22bis.h
++++ b/src/spandsp/private/v22bis.h
+@@ -191,6 +191,12 @@
+ 
+         int pattern_repeats;
+         int last_raw_bits;
++        /*! \brief Phase-step S1 detector for the answerer: the previous
++                   point, the sign of the previous phase step, and the
++                   current run of alternating steps. */
++        complexf_t s1_prev_z;
++        int s1_prev_sign;
++        int s1_run;
+     } rx;
+ 
+     /* Transmit section */
