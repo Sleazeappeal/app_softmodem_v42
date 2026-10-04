@@ -190,6 +190,13 @@ See `tools/`. They need Python 3 and, for the C tools, the patched spandsp.
 | `v22decode.c` | decodes one side of a call recording (8 kHz WAV) as V.22bis + 8N1, to see what was really on the line |
 | `fuzz_regress.c`, `fuzz_regress.sh <spandsp dir>` | AddressSanitizer/UBSan tests of the XID parser and the V.42bis codec with malformed and real inputs |
 
+## See also
+
+[synchronet-bbs-modem-dialin](https://github.com/Sleazeappeal/synchronet-bbs-modem-dialin):
+the complete setup this module was written for. A Synchronet BBS that real
+modems dial over VoIP, with the Asterisk and PBX configuration, a
+byte-transparent RLogin relay, the ATA settings and an installation guide.
+
 ## License
 
 GNU General Public License version 2 (`LICENSE`), as the original module and
