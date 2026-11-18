@@ -118,6 +118,22 @@ make install
 Building against the stock headers compiles, but the module then reads
 spandsp's internal structures at the wrong offsets.
 
+**Disable `BUILD_NATIVE` if the module may run on another CPU.** Asterisk's
+menuselect enables it by default, which adds `-march=native`: the module then
+uses instructions of the build machine's CPU (for example AVX). On a machine
+or VM without them, Asterisk dies with `SIGILL` (systemd `status=4/ILL`,
+kernel `trap invalid opcode ... in app_softmodem.so`) on the first call that
+reaches `Softmodem()`. This happened here after a hypervisor change gave the
+VM a plain QEMU CPU model; registrations kept working because systemd
+restarted Asterisk between calls. Turn it off before building:
+
+```sh
+menuselect/menuselect --disable BUILD_NATIVE menuselect.makeopts
+```
+
+`objdump -d app_softmodem.so | grep -cP '\tv[a-z0-9]+\s'` prints 0 when the
+module contains no AVX (VEX-encoded) instructions.
+
 ## Usage
 
 ```
