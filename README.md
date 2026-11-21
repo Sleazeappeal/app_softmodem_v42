@@ -57,11 +57,15 @@ telephone adapter (Grandstream HT802, Cisco SPA112) and a SIP PBX:
 | USRobotics Sportster 28800 V.FC | yes | yes | yes |
 | HaM / Smart Link MD5628D-L-A PCI softmodem (Windows ME) | yes | not tested | see limitations |
 | Conexant SoftK56 "SoftV92" PCI softmodem | yes | not tested | not tested |
+| Aprotek 6400 (external), Amiga 1200 with NComm 3.05, via HT802 V2 | modem did not offer V.42 | modem did not offer V.42 | yes, login and logoff only |
 
 Tests covered ZMODEM and YMODEM transfers in both directions, and automated
 calls with byte-exact checks of compressible, random and mixed data (see
-`tools/`). Only the answering side (the softmodem answers, a modem calls) has
-been tested.
+`tools/`). The Aprotek call (`CONNECT 2400`, with options `cb`) answered V.42
+detection with nothing, so the module fell back to raw mode
+(`LAPM_V42_UNSUPPORTED`); the caller logged in to the BBS, used it and logged
+off, but no file was transferred. Only the answering side (the softmodem
+answers, a modem calls) has been tested.
 
 ## Contents
 
